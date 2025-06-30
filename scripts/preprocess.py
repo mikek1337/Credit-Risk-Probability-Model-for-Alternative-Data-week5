@@ -1,11 +1,11 @@
 import pandas as pd
 import numpy as np
 import csv
-DATA_FOLDER = '../data'
+DATA_FOLDER = 'data'
 
 def load(filename):
     try:
-        return pd.read_csv(f'../data/{filename}', delimiter='|')
+        return pd.read_csv(f'{DATA_FOLDER}/{filename}', delimiter='|')
     except:
         print(f'{DATA_FOLDER}/{filename}')
         print()
