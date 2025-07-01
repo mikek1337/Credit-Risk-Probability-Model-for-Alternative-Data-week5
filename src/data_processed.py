@@ -1,14 +1,419 @@
 import sys
-sys.path.append('scripts')
 import pandas as pd
 import numpy as np
+import os
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
-from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures, OrdinalEncoder,MinMaxScaler
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-from preprocess import load
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import cross_val_score
 
-preprocessed_data = load('processed/data.csv')
+# Assuming 'preprocess.py' and its 'load' function are correctly set up
+# and 'processed/data.csv' exists and is a valid CSV.
+# sys.path.append('scripts') # Uncomment if 'preprocess.py' is in a 'scripts' subdirectory
+# from preprocess import preprocess_data
+
+# Mock load function for demonstration if preprocess.py is not available
+def load(file_path):
+    """
+    Mock function to simulate loading data.
+    Replace with your actual load function from preprocess.py.
+    """
+    print(f"Simulating loading data from {file_path}")
+    # Create a dummy DataFrame with similar column names for demonstration
+    return pd.read_csv(file_path)
+pdir = os.path.abspath(__file__).split('/')
+pdir.pop()
+
+# Load your preprocessed data
+preprocessed_data = load(os.path.dirname('/'.join(pdir))+'/data/processed/data.csv')
+
+# --- Custom DateTimeExtractor (as provided) ---
+class DateTimeExtractor(BaseEstimator, TransformerMixin):
+    def __init__(self, date_column):
+        self.date_column = date_column
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X_copy = X.copy()
+        if self.date_column not in X_copy.columns:
+            raise KeyError(f"Column '{self.date_column}' not found in the input DataFrame.")
+        try:
+            X_copy[self.date_column] = pd.to_datetime(X_copy[self.date_column])
+        except Exception as e:
+            raise TypeError(
+                f"Could not convert column '{self.date_column}' to datetime. "
+                f"Please ensure it contains valid date/time formats. Error: {e}"
+            )
+        X_copy[f'{self.date_column}_day'] = X_copy[self.date_column].dt.day
+        X_copy[f'{self.date_column}_month'] = X_copy[self.date_column].dt.month
+        X_copy[f'{self.date_column}_year'] = X_copy[self.date_column].dt.year
+        X_copy = X_copy.drop(columns=[self.date_column])
+        return X_copy
+    
+class CustomerAggregator(BaseEstimator, TransformerMixin):
+    """
+    A custom scikit-learn transformer to calculate various customer-level aggregated features
+    such as total lifetime spend, average transaction value, number of transactions,
+    diversity of specified categorical features, recency, and customer tenure.
+
+    This transformer calculates aggregations for each unique ID during the fit phase
+    and then merges these into the DataFrame during the transform phase.
+    This prevents data leakage.
+    """
+    def __init__(self, id_columns, spend_columns, unique_count_columns=None, recency_date_column=None, tenure_date_column=None):
+        """
+        Initializes the CustomerAggregator.
+
+        Parameters
+        ----------
+        id_columns : list of str
+            A list of column names that represent unique identifiers (e.g., ['CustomerId', 'AccountId']).
+        spend_columns : list of str
+            A list of column names that represent spend values (e.g., ['Amount', 'Value']).
+        unique_count_columns : list of str, optional
+            A list of column names for which to count the number of unique values
+            per ID (e.g., ['PricingStrategy']). Defaults to None.
+        recency_date_column : str, optional
+            The column name containing datetime objects to use for recency calculation
+            (e.g., 'TransactionStartTime'). Defaults to None.
+        tenure_date_column : str, optional
+            The column name containing datetime objects to use for tenure calculation
+            (e.g., 'TransactionStartTime'). Defaults to None.
+        """
+        self.id_columns = id_columns
+        self.spend_columns = spend_columns
+        self.unique_count_columns = unique_count_columns if unique_count_columns is not None else []
+        self.recency_date_column = recency_date_column
+        self.tenure_date_column = tenure_date_column if tenure_date_column is not None else recency_date_column # Often same as recency
+        # Store calculated aggregations (sum, mean, count, nunique, recency, tenure) for each ID and column
+        self.agg_maps = {}
+        # Store the overall max date from training for recency/tenure calculation in transform
+        self.overall_max_date_in_training = None
+
+    def fit(self, X, y=None):
+        """
+        Calculates various aggregated features for each unique ID combination from the training data.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            The input DataFrame containing ID, spend, unique count, and date columns.
+        y : array-like, optional
+            Target vector (ignored).
+
+        Returns
+        -------
+        self : CustomerAggregator
+            Returns the instance of the transformer.
+        """
+        # Ensure date columns are datetime type and determine overall max date
+        if self.recency_date_column:
+            if self.recency_date_column not in X.columns:
+                raise KeyError(f"Recency date column '{self.recency_date_column}' not found in the input DataFrame during fit.")
+            X[self.recency_date_column] = pd.to_datetime(X[self.recency_date_column])
+            self.overall_max_date_in_training = X[self.recency_date_column].max()
+        elif self.tenure_date_column: # If only tenure date is provided, use it for overall max date
+            if self.tenure_date_column not in X.columns:
+                raise KeyError(f"Tenure date column '{self.tenure_date_column}' not found in the input DataFrame during fit.")
+            X[self.tenure_date_column] = pd.to_datetime(X[self.tenure_date_column])
+            self.overall_max_date_in_training = X[self.tenure_date_column].max()
 
 
+        for id_col in self.id_columns:
+            if id_col not in X.columns:
+                raise KeyError(f"ID column '{id_col}' not found in the input DataFrame during fit.")
+
+            # Calculate number of transactions for the current ID column
+            num_transactions_series = X.groupby(id_col).size() # .size() counts rows in each group
+            self.agg_maps[f'Num_Transactions_by_{id_col}'] = num_transactions_series.to_dict()
+
+            for spend_col in self.spend_columns:
+                if spend_col not in X.columns:
+                    raise KeyError(f"Spend column '{spend_col}' not found in the input DataFrame during fit.")
+
+                # Calculate total spend (sum) for the current ID and spend column
+                total_spend_series = X.groupby(id_col)[spend_col].sum()
+                self.agg_maps[f'Sum_Spend_{spend_col}_by_{id_col}'] = total_spend_series.to_dict()
+
+                # Calculate average spend (mean) for the current ID and spend column
+                avg_spend_series = X.groupby(id_col)[spend_col].mean()
+                self.agg_maps[f'Avg_Spend_{spend_col}_by_{id_col}'] = avg_spend_series.to_dict()
+
+            for unique_col in self.unique_count_columns:
+                if unique_col not in X.columns:
+                    raise KeyError(f"Unique count column '{unique_col}' not found in the input DataFrame during fit.")
+                # Calculate number of unique values for the current ID and unique column
+                unique_count_series = X.groupby(id_col)[unique_col].nunique()
+                self.agg_maps[f'Unique_{unique_col}_by_{id_col}'] = unique_count_series.to_dict()
+
+            # Recency Calculation
+            if self.recency_date_column:
+                # Find the latest transaction date for each ID
+                max_date_for_id = X.groupby(id_col)[self.recency_date_column].max()
+                # Calculate recency: difference in days from the overall latest training date
+                recency_series = (self.overall_max_date_in_training - max_date_for_id).dt.days
+                self.agg_maps[f'Recency_Days_by_{id_col}'] = recency_series.to_dict()
+
+            # Tenure Calculation
+            if self.tenure_date_column:
+                # Find the earliest transaction date for each ID
+                min_date_for_id = X.groupby(id_col)[self.tenure_date_column].min()
+                # Calculate tenure in days: difference from the earliest transaction to overall latest training date
+                tenure_days_series = (self.overall_max_date_in_training - min_date_for_id).dt.days
+                self.agg_maps[f'Customer_Tenure_Days_by_{id_col}'] = tenure_days_series.to_dict()
+                # Convert to months and weeks
+                self.agg_maps[f'Customer_Tenure_Months_by_{id_col}'] = (tenure_days_series / 30.44).to_dict()
+                self.agg_maps[f'Customer_Tenure_Weeks_by_{id_col}'] = (tenure_days_series / 7).to_dict()
+
+        return self
+
+    def transform(self, X):
+        """
+        Adds the pre-calculated aggregated features (sum, mean, count, unique counts, recency, tenure, frequency)
+        to the DataFrame.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            The input DataFrame to transform.
+
+        Returns
+        -------
+        pandas.DataFrame
+            A new DataFrame with the added aggregated columns.
+        """
+        X_copy = X.copy()
+
+        # Ensure date columns are datetime type if specified, for calculations within transform
+        if self.recency_date_column:
+            if self.recency_date_column not in X_copy.columns:
+                raise KeyError(f"Recency date column '{self.recency_date_column}' not found in the input DataFrame during transform.")
+            X_copy[self.recency_date_column] = pd.to_datetime(X_copy[self.recency_date_column])
+        if self.tenure_date_column and self.tenure_date_column != self.recency_date_column:
+            if self.tenure_date_column not in X_copy.columns:
+                raise KeyError(f"Tenure date column '{self.tenure_date_column}' not found in the input DataFrame during transform.")
+            X_copy[self.tenure_date_column] = pd.to_datetime(X_copy[self.tenure_date_column])
+
+
+        for id_col in self.id_columns:
+            # Add Number of Transactions feature
+            num_transactions_col_name = f'Num_Transactions_by_{id_col}'
+            num_transactions_map = self.agg_maps.get(num_transactions_col_name, {})
+            # Fill new IDs with 0 transactions
+            X_copy[num_transactions_col_name] = X_copy[id_col].map(num_transactions_map).fillna(0)
+
+            for spend_col in self.spend_columns:
+                # Add Sum features
+                sum_col_name = f'Sum_Spend_{spend_col}_by_{id_col}'
+                sum_map = self.agg_maps.get(sum_col_name, {})
+                X_copy[sum_col_name] = X_copy[id_col].map(sum_map).fillna(0) # Fill new IDs with 0 spend
+
+                # Add Average features
+                avg_col_name = f'Avg_Spend_{spend_col}_by_{id_col}'
+                avg_map = self.agg_maps.get(avg_col_name, {})
+                # For new IDs, fill with 0 or the global average if preferred, but 0 is safer for new entities
+                X_copy[avg_col_name] = X_copy[id_col].map(avg_map).fillna(0)
+
+            for unique_col in self.unique_count_columns:
+                unique_count_col_name = f'Unique_{unique_col}_by_{id_col}'
+                unique_count_map = self.agg_maps.get(unique_count_col_name, {})
+                # Fill new IDs with 0 unique values
+                X_copy[unique_count_col_name] = X_copy[id_col].map(unique_count_map).fillna(0)
+
+            # Add Recency feature
+            if self.recency_date_column:
+                recency_col_name = f'Recency_Days_by_{id_col}'
+                recency_map = self.agg_maps.get(recency_col_name, {})
+
+                # Apply the mapped recency
+                X_copy[recency_col_name] = X_copy[id_col].map(recency_map)
+
+                # Handle new IDs (NaNs after map)
+                if self.overall_max_date_in_training is not None:
+                    potential_recency_for_new_ids = (self.overall_max_date_in_training - X_copy[self.recency_date_column]).dt.days
+                    X_copy[recency_col_name] = X_copy[recency_col_name].fillna(potential_recency_for_new_ids)
+                else:
+                    X_copy[recency_col_name] = X_copy[recency_col_name].fillna(0) # Fallback
+
+                # Ensure recency is non-negative (clamping at 0)
+                X_copy[recency_col_name] = np.maximum(0, X_copy[recency_col_name])
+
+            # Add Tenure features
+            if self.tenure_date_column:
+                tenure_days_col_name = f'Customer_Tenure_Days_by_{id_col}'
+                tenure_days_map = self.agg_maps.get(tenure_days_col_name, {})
+                X_copy[tenure_days_col_name] = X_copy[id_col].map(tenure_days_map)
+
+                tenure_months_col_name = f'Customer_Tenure_Months_by_{id_col}'
+                tenure_months_map = self.agg_maps.get(tenure_months_col_name, {})
+                X_copy[tenure_months_col_name] = X_copy[id_col].map(tenure_months_map)
+
+                tenure_weeks_col_name = f'Customer_Tenure_Weeks_by_{id_col}'
+                tenure_weeks_map = self.agg_maps.get(tenure_weeks_col_name, {})
+                X_copy[tenure_weeks_col_name] = X_copy[id_col].map(tenure_weeks_map)
+
+
+                # Handle new IDs for tenure (NaNs after map)
+                if self.overall_max_date_in_training is not None:
+                    # Calculate min date for new IDs based on their own transactions
+                    min_date_for_new_ids = X_copy.groupby(id_col)[self.tenure_date_column].transform('min')
+                    potential_tenure_days_for_new_ids = (self.overall_max_date_in_training - min_date_for_new_ids).dt.days
+                    X_copy[tenure_days_col_name] = X_copy[tenure_days_col_name].fillna(potential_tenure_days_for_new_ids)
+                    X_copy[tenure_months_col_name] = X_copy[tenure_months_col_name].fillna(potential_tenure_days_for_new_ids / 30.44)
+                    X_copy[tenure_weeks_col_name] = X_copy[tenure_weeks_col_name].fillna(potential_tenure_days_for_new_ids / 7)
+                else:
+                    X_copy[tenure_days_col_name] = X_copy[tenure_days_col_name].fillna(0)
+                    X_copy[tenure_months_col_name] = X_copy[tenure_months_col_name].fillna(0)
+                    X_copy[tenure_weeks_col_name] = X_copy[tenure_weeks_col_name].fillna(0)
+
+                # Ensure tenure is non-negative
+                X_copy[tenure_days_col_name] = np.maximum(0, X_copy[tenure_days_col_name])
+                X_copy[tenure_months_col_name] = np.maximum(0, X_copy[tenure_months_col_name])
+                X_copy[tenure_weeks_col_name] = np.maximum(0, X_copy[tenure_weeks_col_name])
+
+
+            # Add Purchase Frequency features (after tenure and num_transactions are available)
+            if self.tenure_date_column: # Only calculate if tenure is also being calculated
+                # Transactions Per Month
+                transactions_per_month_col_name = f'Transactions_Per_Month_by_{id_col}'
+                tenure_months_series = X_copy[f'Customer_Tenure_Months_by_{id_col}']
+                num_transactions_series = X_copy[f'Num_Transactions_by_{id_col}']
+
+                # Avoid division by zero: if tenure is 0, frequency is 0
+                X_copy[transactions_per_month_col_name] = np.where(
+                    tenure_months_series > 0,
+                    num_transactions_series / tenure_months_series,
+                    0
+                )
+
+                # Transactions Per Week
+                transactions_per_week_col_name = f'Transactions_Per_Week_by_{id_col}'
+                tenure_weeks_series = X_copy[f'Customer_Tenure_Weeks_by_{id_col}']
+                # Avoid division by zero: if tenure is 0, frequency is 0
+                X_copy[transactions_per_week_col_name] = np.where(
+                    tenure_weeks_series > 0,
+                    num_transactions_series / tenure_weeks_series,
+                    0
+                )
+
+        return X_copy
+
+
+def feature_engineering_pipeline():
+    # --- Separate Features (X) and Target (y) ---
+    # This is crucial to prevent data leakage
+    X = preprocessed_data.drop('FraudResult', axis=1)
+    y = preprocessed_data['FraudResult']
+
+    # --- Define Column Types for Preprocessing ---
+    # Identify columns to be dropped (high cardinality identifiers)
+    columns_to_drop = ['TransactionId', 'CustomerId', 'BatchId', 'AccountId', 'SubscriptionId','ProductId', 'ChannelId', 'ProviderId'] # Add other high-cardinality IDs if needed
+
+    # Numerical features (excluding the target 'FraudResult')
+    numerical_features = ['Amount', 'Value']
+
+    # Categorical features (excluding high-cardinality IDs)
+    # Ensure 'ProductCategory' is included here if it's truly categorical and not an ID
+    categorical_features = [ 'CurrencyCode',  'ProductCategory', 'CountryCode', 'PricingStrategy']
+
+    # Date feature
+    date_features = ['TransactionStartTime']
+
+    # --- Define Preprocessing Pipelines for each type ---
+    numerical_transformers = Pipeline(steps=[
+        ('imputer', KNNImputer(n_neighbors=5)),
+        ('scaler', StandardScaler()),
+        ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+        ('normalize', MinMaxScaler())
+    ])
+
+    categorical_transformers = Pipeline(steps=[
+         ('imputer', SimpleImputer(strategy='most_frequent')), # Impute before one-hot encoding
+         ('ordinal', OrdinalEncoder(handle_unknown='error')) # Changed to OrdinalEncoder
+    ])
+
+    # Your DateTimeExtractor is used here.
+    # The 'TransactionStartTime' will be passed as a single-column DataFrame to it.
+    date_transformers = Pipeline(steps=[
+         ('date_extractor', DateTimeExtractor('TransactionStartTime'))
+    ])
+
+    # --- Create the ColumnTransformer ---
+    # This applies different transformers to different columns.
+    # 'drop' is used for columns that should be removed.
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('numerical', numerical_transformers, numerical_features),
+            ('categorical', categorical_transformers, categorical_features),
+            ('date', date_transformers, date_features),
+            # Use 'drop' to explicitly remove high-cardinality identifier columns
+            ('drop_ids', 'drop', columns_to_drop)
+        ]
+        # Removed remainder='passthrough' to ensure all columns are handled
+    )
+
+    # --- Create the Full Feature Engineering Pipeline ---
+    # This pipeline only handles preprocessing. You would typically add a model after this.
+    feature_engineering_pipeline = Pipeline(steps=[
+        ('customer_agg', CustomerAggregator(
+         id_columns=['CustomerId', 'AccountId'],
+         spend_columns=['Value', 'Amount'],
+         unique_count_columns=['PricingStrategy'],
+         recency_date_column='TransactionStartTime',
+         tenure_date_column='TransactionStartTime'
+     )),
+         ('preprocess', preprocessor)
+    ])
+
+    # --- Apply the Feature Engineering Pipeline ---
+    # It's good practice to split data before fitting the pipeline to avoid data leakage
+    # from test set to training set during preprocessing.
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    print("Original X_train head (before feature engineering):")
+    print(X_train.head())
+    print("\n" + "="*50 + "\n")
+
+    print("Applying feature engineering pipeline to X_train...")
+    feature_processed_train = feature_engineering_pipeline.fit_transform(X_train)
+    print("Feature engineering complete for X_train.")
+
+    # Transform X_test using the *fitted* pipeline from X_train
+    print("Applying feature engineering pipeline to X_test...")
+    feature_processed_test = feature_engineering_pipeline.transform(X_test)
+    print("Feature engineering complete for X_test.")
+
+
+    print("\nShape of feature_processed_train:", feature_processed_train.shape)
+    print("Shape of feature_processed_test:", feature_processed_test.shape)
+    clustering_pipeline = Pipeline(steps=[
+        ('feature_engineering', feature_engineering_pipeline), # Uses the complete feature engineering pipeline
+        ('kmeans', KMeans(n_clusters=3, random_state=42, n_init=10)) # K-Means clustering with 3 clusters
+    ])
+    return {
+        'feature_processed_train':feature_processed_train,
+        'feature_processed_test': feature_processed_test
+    }
+    # You would then typically add your machine learning model to the pipeline
+    # For example:
+    # from sklearn.ensemble import RandomForestClassifier
+    # final_model_pipeline = Pipeline(steps=[
+    #     ('feature_engineering', preprocessor), # Use the preprocessor directly
+    #     ('classifier', RandomForestClassifier(random_state=42))
+    # ])
+    #
+    # print("\nTraining full model pipeline...")
+    # final_model_pipeline.fit(X_train, y_train)
+    # print("Full model pipeline training complete.")
+    #
+    # y_pred = final_model_pipeline.predict(X_test)
+    # print(f"\nModel Accuracy: {accuracy_score(y_test, y_pred):.2f}")
+
+if __name__ == '__main__':
+    feature_engineering_pipeline()
