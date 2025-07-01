@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import cross_val_score
-
+from sklearn.cluster import KMeans
 # Assuming 'preprocess.py' and its 'load' function are correctly set up
 # and 'processed/data.csv' exists and is a valid CSV.
 # sys.path.append('scripts') # Uncomment if 'preprocess.py' is in a 'scripts' subdirectory
@@ -113,49 +113,51 @@ class CustomerAggregator(BaseEstimator, TransformerMixin):
             Returns the instance of the transformer.
         """
         # Ensure date columns are datetime type and determine overall max date
+        # Create a copy to avoid SettingWithCopyWarning
+        X_copy_for_fit = X.copy()
         if self.recency_date_column:
-            if self.recency_date_column not in X.columns:
+            if self.recency_date_column not in X_copy_for_fit.columns:
                 raise KeyError(f"Recency date column '{self.recency_date_column}' not found in the input DataFrame during fit.")
-            X[self.recency_date_column] = pd.to_datetime(X[self.recency_date_column])
-            self.overall_max_date_in_training = X[self.recency_date_column].max()
+            X_copy_for_fit[self.recency_date_column] = pd.to_datetime(X_copy_for_fit[self.recency_date_column])
+            self.overall_max_date_in_training = X_copy_for_fit[self.recency_date_column].max()
         elif self.tenure_date_column: # If only tenure date is provided, use it for overall max date
-            if self.tenure_date_column not in X.columns:
+            if self.tenure_date_column not in X_copy_for_fit.columns:
                 raise KeyError(f"Tenure date column '{self.tenure_date_column}' not found in the input DataFrame during fit.")
-            X[self.tenure_date_column] = pd.to_datetime(X[self.tenure_date_column])
-            self.overall_max_date_in_training = X[self.tenure_date_column].max()
+            X_copy_for_fit[self.tenure_date_column] = pd.to_datetime(X_copy_for_fit[self.tenure_date_column])
+            self.overall_max_date_in_training = X_copy_for_fit[self.tenure_date_column].max()
 
 
         for id_col in self.id_columns:
-            if id_col not in X.columns:
+            if id_col not in X_copy_for_fit.columns:
                 raise KeyError(f"ID column '{id_col}' not found in the input DataFrame during fit.")
 
             # Calculate number of transactions for the current ID column
-            num_transactions_series = X.groupby(id_col).size() # .size() counts rows in each group
+            num_transactions_series = X_copy_for_fit.groupby(id_col).size() # .size() counts rows in each group
             self.agg_maps[f'Num_Transactions_by_{id_col}'] = num_transactions_series.to_dict()
 
             for spend_col in self.spend_columns:
-                if spend_col not in X.columns:
+                if spend_col not in X_copy_for_fit.columns:
                     raise KeyError(f"Spend column '{spend_col}' not found in the input DataFrame during fit.")
 
                 # Calculate total spend (sum) for the current ID and spend column
-                total_spend_series = X.groupby(id_col)[spend_col].sum()
+                total_spend_series = X_copy_for_fit.groupby(id_col)[spend_col].sum()
                 self.agg_maps[f'Sum_Spend_{spend_col}_by_{id_col}'] = total_spend_series.to_dict()
 
                 # Calculate average spend (mean) for the current ID and spend column
-                avg_spend_series = X.groupby(id_col)[spend_col].mean()
+                avg_spend_series = X_copy_for_fit.groupby(id_col)[spend_col].mean()
                 self.agg_maps[f'Avg_Spend_{spend_col}_by_{id_col}'] = avg_spend_series.to_dict()
 
             for unique_col in self.unique_count_columns:
-                if unique_col not in X.columns:
+                if unique_col not in X_copy_for_fit.columns:
                     raise KeyError(f"Unique count column '{unique_col}' not found in the input DataFrame during fit.")
                 # Calculate number of unique values for the current ID and unique column
-                unique_count_series = X.groupby(id_col)[unique_col].nunique()
+                unique_count_series = X_copy_for_fit.groupby(id_col)[unique_col].nunique()
                 self.agg_maps[f'Unique_{unique_col}_by_{id_col}'] = unique_count_series.to_dict()
 
             # Recency Calculation
             if self.recency_date_column:
                 # Find the latest transaction date for each ID
-                max_date_for_id = X.groupby(id_col)[self.recency_date_column].max()
+                max_date_for_id = X_copy_for_fit.groupby(id_col)[self.recency_date_column].max()
                 # Calculate recency: difference in days from the overall latest training date
                 recency_series = (self.overall_max_date_in_training - max_date_for_id).dt.days
                 self.agg_maps[f'Recency_Days_by_{id_col}'] = recency_series.to_dict()
@@ -163,7 +165,7 @@ class CustomerAggregator(BaseEstimator, TransformerMixin):
             # Tenure Calculation
             if self.tenure_date_column:
                 # Find the earliest transaction date for each ID
-                min_date_for_id = X.groupby(id_col)[self.tenure_date_column].min()
+                min_date_for_id = X_copy_for_fit.groupby(id_col)[self.tenure_date_column].min()
                 # Calculate tenure in days: difference from the earliest transaction to overall latest training date
                 tenure_days_series = (self.overall_max_date_in_training - min_date_for_id).dt.days
                 self.agg_maps[f'Customer_Tenure_Days_by_{id_col}'] = tenure_days_series.to_dict()
@@ -304,6 +306,74 @@ class CustomerAggregator(BaseEstimator, TransformerMixin):
 
         return X_copy
 
+class RFMClusterLabeler(BaseEstimator, TransformerMixin):
+    """
+    A custom scikit-learn transformer to perform K-Means clustering on RFM features
+    and assign a binary 'is_high_risk' label based on cluster analysis.
+    """
+    def __init__(self, rfm_features, n_clusters=3, random_state=42):
+        self.rfm_features = rfm_features
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+        self.scaler = StandardScaler() # To scale RFM features before clustering
+        self.high_risk_cluster_id = None
+        self.cluster_summary = None # To store summary for analysis
+
+    def fit(self, X, y=None):
+        # Ensure RFM features exist in X
+        missing_rfm_features = [f for f in self.rfm_features if f not in X.columns]
+        if missing_rfm_features:
+            raise KeyError(f"Missing RFM features for clustering: {missing_rfm_features}. Ensure CustomerAggregator creates them.")
+
+        X_rfm = X[self.rfm_features].copy() # Work on a copy to avoid SettingWithCopyWarning
+        X_rfm_scaled = self.scaler.fit_transform(X_rfm)
+        cluster_labels = self.kmeans.fit_predict(X_rfm_scaled)
+
+        # For analysis, join cluster labels back to non-scaled RFM features
+        X_rfm_analysis = X_rfm.copy()
+        X_rfm_analysis['Cluster'] = cluster_labels
+        self.cluster_summary = X_rfm_analysis.groupby('Cluster')[self.rfm_features].mean()
+
+        print("\nCluster RFM Summary (Mean values - before scaling for interpretation):")
+        print(self.cluster_summary)
+
+        # Identify the high-risk cluster (typically highest Recency, lowest Frequency, lowest Monetary)
+        # Assuming rfm_features are ordered: [Recency, Frequency, Monetary]
+        if len(self.rfm_features) >= 3:
+            # Sort by Recency (desc), Frequency (asc), Monetary (asc)
+            self.high_risk_cluster_id = self.cluster_summary.sort_values(
+                by=[self.rfm_features[0], self.rfm_features[1], self.rfm_features[2]],
+                ascending=[False, True, True]
+            ).index[0]
+        else:
+            # Fallback if not enough specific RFM features are provided for full heuristic
+            print("Warning: Less than 3 RFM features provided. Identifying high-risk based on available features.")
+            if self.rfm_features:
+                # Find the feature that looks like Recency
+                recency_feature_name = next((f for f in self.rfm_features if "Recency" in f), self.rfm_features[0])
+                self.high_risk_cluster_id = self.cluster_summary[recency_feature_name].idxmax() # Max Recency is highest risk
+            else:
+                raise ValueError("No RFM features provided for clustering and high-risk identification.")
+
+        print(f"\nIdentified High-Risk Cluster ID: {self.high_risk_cluster_id}")
+        return self
+
+    def transform(self, X):
+        X_copy = X.copy()
+        # Ensure RFM features exist in X_copy
+        missing_rfm_features = [f for f in self.rfm_features if f not in X_copy.columns]
+        if missing_rfm_features:
+            raise KeyError(f"Missing RFM features for transformation: {missing_rfm_features}. Cannot assign 'is_high_risk'.")
+
+        X_rfm = X_copy[self.rfm_features].copy()
+        X_rfm_scaled = self.scaler.transform(X_rfm) # Use fitted scaler
+        cluster_labels = self.kmeans.predict(X_rfm_scaled) # Use fitted KMeans
+
+        # Assign 'is_high_risk' label
+        X_copy['is_high_risk'] = np.where(cluster_labels == self.high_risk_cluster_id, 1, 0)
+        return X_copy
+
 
 def feature_engineering_pipeline():
     # --- Separate Features (X) and Target (y) ---
@@ -324,7 +394,22 @@ def feature_engineering_pipeline():
 
     # Date feature
     date_features = ['TransactionStartTime']
-
+    customer_agg_numerical_features = [
+    'Num_Transactions_by_CustomerId', 'Sum_Spend_Value_by_CustomerId', 'Sum_Spend_Amount_by_CustomerId',
+    'Avg_Spend_Value_by_CustomerId', 'Avg_Spend_Amount_by_CustomerId', 'Unique_PricingStrategy_by_CustomerId',
+    'Recency_Days_by_CustomerId', 'Customer_Tenure_Days_by_CustomerId', 'Customer_Tenure_Months_by_CustomerId',
+    'Customer_Tenure_Weeks_by_CustomerId', 'Transactions_Per_Month_by_CustomerId', 'Transactions_Per_Week_by_CustomerId',
+    'Num_Transactions_by_AccountId', 'Sum_Spend_Value_by_AccountId', 'Sum_Spend_Amount_by_AccountId',
+    'Avg_Spend_Value_by_AccountId', 'Avg_Spend_Amount_by_AccountId', 'Unique_PricingStrategy_by_AccountId',
+    'Recency_Days_by_AccountId', 'Customer_Tenure_Days_by_AccountId', 'Customer_Tenure_Months_by_AccountId',
+    'Customer_Tenure_Weeks_by_AccountId', 'Transactions_Per_Month_by_AccountId', 'Transactions_Per_Week_by_AccountId'
+    ]
+    new_derived_numerical_features = ['is_high_risk']
+    numerical_features_for_preprocessor = (
+    numerical_features +
+    customer_agg_numerical_features +
+    new_derived_numerical_features
+)
     # --- Define Preprocessing Pipelines for each type ---
     numerical_transformers = Pipeline(steps=[
         ('imputer', KNNImputer(n_neighbors=5)),
@@ -349,7 +434,7 @@ def feature_engineering_pipeline():
     # 'drop' is used for columns that should be removed.
     preprocessor = ColumnTransformer(
         transformers=[
-            ('numerical', numerical_transformers, numerical_features),
+            ('numerical', numerical_transformers, numerical_features_for_preprocessor),
             ('categorical', categorical_transformers, categorical_features),
             ('date', date_transformers, date_features),
             # Use 'drop' to explicitly remove high-cardinality identifier columns
@@ -357,10 +442,31 @@ def feature_engineering_pipeline():
         ]
         # Removed remainder='passthrough' to ensure all columns are handled
     )
+    rfm_features_for_clustering_actual = [
+    'Recency_Days_by_CustomerId',
+    'Num_Transactions_by_CustomerId',
+    'Sum_Spend_Value_by_CustomerId' # Assuming 'Value' is the primary monetary measure
+    ]
+
+    final_ml_pipeline = Pipeline(steps=[
+     ('customer_agg', CustomerAggregator(
+         id_columns=['CustomerId', 'AccountId'],
+         spend_columns=['Value', 'Amount'],
+         unique_count_columns=['PricingStrategy'],
+         recency_date_column='TransactionStartTime',
+         tenure_date_column='TransactionStartTime'
+     )),
+     ('rfm_cluster_labeler', RFMClusterLabeler(
+         rfm_features=rfm_features_for_clustering_actual,
+         n_clusters=3,
+         random_state=42
+     )),
+     ('preprocess_features', preprocessor) # This now preprocesses all features including 'is_high_risk'
+    ])
 
     # --- Create the Full Feature Engineering Pipeline ---
     # This pipeline only handles preprocessing. You would typically add a model after this.
-    feature_engineering_pipeline = Pipeline(steps=[
+    """ feature_engineering_pipeline = Pipeline(steps=[
         ('customer_agg', CustomerAggregator(
          id_columns=['CustomerId', 'AccountId'],
          spend_columns=['Value', 'Amount'],
@@ -369,36 +475,30 @@ def feature_engineering_pipeline():
          tenure_date_column='TransactionStartTime'
      )),
          ('preprocess', preprocessor)
-    ])
+    ]) """
 
     # --- Apply the Feature Engineering Pipeline ---
     # It's good practice to split data before fitting the pipeline to avoid data leakage
     # from test set to training set during preprocessing.
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+   
+    print("Applying feature engineering pipeline to preprocessed data...")
+    feature_processed_train = final_ml_pipeline.fit_transform(preprocessed_data)
+    print("Feature engineering complete for preprocessed data.")
 
-    print("Original X_train head (before feature engineering):")
-    print(X_train.head())
-    print("\n" + "="*50 + "\n")
-
-    print("Applying feature engineering pipeline to X_train...")
-    feature_processed_train = feature_engineering_pipeline.fit_transform(X_train)
-    print("Feature engineering complete for X_train.")
-
-    # Transform X_test using the *fitted* pipeline from X_train
+    """ # Transform X_test using the *fitted* pipeline from X_train
     print("Applying feature engineering pipeline to X_test...")
     feature_processed_test = feature_engineering_pipeline.transform(X_test)
     print("Feature engineering complete for X_test.")
-
+ """
 
     print("\nShape of feature_processed_train:", feature_processed_train.shape)
-    print("Shape of feature_processed_test:", feature_processed_test.shape)
-    clustering_pipeline = Pipeline(steps=[
-        ('feature_engineering', feature_engineering_pipeline), # Uses the complete feature engineering pipeline
-        ('kmeans', KMeans(n_clusters=3, random_state=42, n_init=10)) # K-Means clustering with 3 clusters
-    ])
+    # print("Shape of feature_processed_test:", feature_processed_test.shape)
     return {
         'feature_processed_train':feature_processed_train,
-        'feature_processed_test': feature_processed_test
+        'processed_data':preprocessed_data
+        # 'feature_processed_test': feature_processed_test,
+        # 'X_train': X_train,
+        # 'X_test': X_test
     }
     # You would then typically add your machine learning model to the pipeline
     # For example:
