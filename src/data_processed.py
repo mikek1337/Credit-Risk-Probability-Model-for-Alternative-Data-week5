@@ -11,6 +11,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import cross_val_score
 from sklearn.cluster import KMeans
+import joblib
 # Assuming 'preprocess.py' and its 'load' function are correctly set up
 # and 'processed/data.csv' exists and is a valid CSV.
 # sys.path.append('scripts') # Uncomment if 'preprocess.py' is in a 'scripts' subdirectory
@@ -543,6 +544,11 @@ def feature_engineering_pipeline(data:pd.DataFrame):
     
     print("Applying feature engineering pipeline to preprocessed data...")
     feature_processed_train = final_ml_pipeline.fit_transform(data)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    model_artifacts_dir = os.path.join(current_dir, '../full_feat_pipeline')
+    os.makedirs(model_artifacts_dir, exist_ok=True)
+    joblib.dump(feature_processed_train, os.path.join(model_artifacts_dir, 'full_feature_pipeline.joblib'))
+    # feature_processed_train = feature_processed_train.transform(data)
     print("Feature engineering complete for preprocessed data.")
     feature_names_out = final_ml_pipeline.named_steps['preprocess_features'].get_feature_names_out()
 
